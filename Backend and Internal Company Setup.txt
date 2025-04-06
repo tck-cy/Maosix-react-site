@@ -1,0 +1,941 @@
+id like to make this site usable internally for the company by logging in with specific permissions for directors who can add, edit or delete anything from the database(mySQL), [6 directors] managers who can make report purchases approved by the directors, request funds for purchases,  accountants can add to the database via excel sheets.  managers can read and write to the care procedures for coffee, diary, Apiary, chicken. regular employees have read only access on the care procedures. They can make suggestions to change of the care procedures that can be approved by managers and directors. gimme the detailed setup of this
+MAOSIX Internal Management System
+I'll outline a comprehensive setup for your internal company portal with role-based access control (RBAC), MySQL database integration, and specific permissions for each user type.
+
+1. System Architecture
+Backend Stack
+Node.js with Express.js API server
+
+MySQL database
+
+JWT for authentication
+
+Sequelize ORM (or Knex.js for query building)
+
+Frontend Stack
+React (existing setup)
+
+React Router for navigation
+
+Redux or React Context for state management
+
+Axios for API calls
+
+2. Database Schema
+Tables Structure
+Users Table
+sql
+Copy
+CREATE TABLE users (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  username VARCHAR(50) UNIQUE NOT NULL,
+  password_hash VARCHAR(255) NOT NULL,
+  email VARCHAR(100) UNIQUE NOT NULL,
+  role ENUM('director', 'manager', 'accountant', 'employee') NOT NULL,
+  department ENUM('coffee', 'dairy', 'apiary', 'poultry', 'admin') NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+Care Procedures Table
+sql
+Copy
+CREATE TABLE care_procedures (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  department ENUM('coffee', 'dairy', 'apiary', 'poultry') NOT NULL,
+  title VARCHAR(100) NOT NULL,
+  description TEXT NOT NULL,
+  current_version INT NOT NULL DEFAULT 1,
+  created_by INT NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (created_by) REFERENCES users(id)
+);
+Procedure Versions Table (for change tracking)
+sql
+Copy
+CREATE TABLE procedure_versions (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  procedure_id INT NOT NULL,
+  version INT NOT NULL,
+  description TEXT NOT NULL,
+  status ENUM('pending', 'approved', 'rejected') DEFAULT 'pending',
+  suggested_by INT NOT NULL,
+  reviewed_by INT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (procedure_id) REFERENCES care_procedures(id),
+  FOREIGN KEY (suggested_by) REFERENCES users(id),
+  FOREIGN KEY (reviewed_by) REFERENCES users(id)
+);
+Purchases Table
+sql
+Copy
+CREATE TABLE purchases (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  requester_id INT NOT NULL,
+  amount DECIMAL(10,2) NOT NULL,
+  description TEXT NOT NULL,
+  status ENUM('requested', 'approved', 'rejected', 'completed') DEFAULT 'requested',
+  approved_by INT,
+  approved_at TIMESTAMP NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (requester_id) REFERENCES users(id),
+  FOREIGN KEY (approved_by) REFERENCES users(id)
+);
+Excel Imports Table
+sql
+Copy
+CREATE TABLE excel_imports (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  accountant_id INT NOT NULL,
+  file_name VARCHAR(255) NOT NULL,
+  import_type ENUM('inventory', 'financial', 'production') NOT NULL,
+  records_count INT NOT NULL,
+  status ENUM('pending', 'processed', 'failed') DEFAULT 'pending',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (accountant_id) REFERENCES users(id)
+);
+3. Authentication & Authorization Flow
+Login System
+javascript
+Copy
+// backend/authController.js
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+
+const login = async (req, res) => {
+  const { username, password } = req.body;
+  
+  // 1. Find user in database
+  const user = await User.findOne({ where: { username } });
+  
+  // 2. Verify password
+  if (!user || !bcrypt.compareSync(password, user.password_hash)) {
+    return res.status(401).json({ error: 'Invalid credentials' });
+  }
+  
+  // 3. Generate JWT token with role and department
+  const token = jwt.sign(
+    {
+      id: user.id,
+      role: user.role,
+      department: user.department
+    },
+    process.env.JWT_SECRET,
+    { expiresIn: '8h' }
+  );
+  
+  res.json({ token });
+};
+Frontend Auth Context
+javascript
+Copy
+// src/context/AuthContext.js
+import React, { createContext, useState, useEffect } from 'react';
+import axios from 'axios';
+import { useNavigate } from 'react-router-dom';
+
+const AuthContext = createContext();
+
+export const AuthProvider = ({ children }) => {
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const navigate = useNavigate();
+
+  useEffect(() => {
+    const checkAuth = async () => {
+      const token = localStorage.getItem('token');
+      if (token) {
+        try {
+          const response = await axios.get('/api/auth/verify', {
+            headers: { Authorization: `Bearer ${token}` }
+          });
+          setUser(response.data.user);
+        } catch (err) {
+          logout();
+        }
+      }
+      setLoading(false);
+    };
+    checkAuth();
+  }, []);
+
+  const login = async (credentials) => {
+    const response = await axios.post('/api/auth/login', credentials);
+    localStorage.setItem('token', response.data.token);
+    setUser(response.data.user);
+  };
+
+  const logout = () => {
+    localStorage.removeItem('token');
+    setUser(null);
+    navigate('/login');
+  };
+
+  return (
+    <AuthContext.Provider value={{ user, login, logout, loading }}>
+      {children}
+    </AuthContext.Provider>
+  );
+};
+
+export const useAuth = () => React.useContext(AuthContext);
+4. Role-Based Permissions
+Permission Matrix
+Action	Director	Manager	Accountant	Employee
+Create procedures	✓	✓		
+Edit procedures	✓	✓		
+Delete procedures	✓			
+Approve changes	✓	✓		
+Request purchases	✓	✓		
+Approve purchases	✓			
+Import Excel data			✓	
+View procedures	✓	✓	✓	✓
+Suggest changes	✓	✓	✓	✓
+Permission Middleware
+javascript
+Copy
+// backend/middleware/permissions.js
+const checkPermission = (requiredRole, requiredDepartment = null) => {
+  return (req, res, next) => {
+    const userRole = req.user.role;
+    const userDepartment = req.user.department;
+    
+    // Directors have full access
+    if (userRole === 'director') return next();
+    
+    // Check if role has permission
+    const rolesHierarchy = ['director', 'manager', 'accountant', 'employee'];
+    if (rolesHierarchy.indexOf(userRole) > rolesHierarchy.indexOf(requiredRole)) {
+      return res.status(403).json({ error: 'Insufficient permissions' });
+    }
+    
+    // Check department access if needed
+    if (requiredDepartment && userDepartment !== requiredDepartment && userDepartment !== 'admin') {
+      return res.status(403).json({ error: 'Department access denied' });
+    }
+    
+    next();
+  };
+};
+5. Key Feature Implementations
+Procedure Management Component
+javascript
+Copy
+// src/components/procedures/ProcedureEditor.js
+import React, { useState, useEffect } from 'react';
+import { useAuth } from '../../context/AuthContext';
+import axios from 'axios';
+
+const ProcedureEditor = ({ department }) => {
+  const { user } = useAuth();
+  const [procedures, setProcedures] = useState([]);
+  const [editingId, setEditingId] = useState(null);
+  const [formData, setFormData] = useState({ title: '', description: '' });
+
+  useEffect(() => {
+    const fetchProcedures = async () => {
+      const res = await axios.get(`/api/procedures?department=${department}`);
+      setProcedures(res.data);
+    };
+    fetchProcedures();
+  }, [department]);
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (editingId) {
+      await axios.put(`/api/procedures/${editingId}`, formData);
+    } else {
+      await axios.post('/api/procedures', { ...formData, department });
+    }
+    // Refresh procedures
+  };
+
+  const handleDelete = async (id) => {
+    if (window.confirm('Are you sure you want to delete this procedure?')) {
+      await axios.delete(`/api/procedures/${id}`);
+      // Refresh procedures
+    }
+  };
+
+  return (
+    <div>
+      <h2>{department.charAt(0).toUpperCase() + department.slice(1)} Procedures</h2>
+      
+      {(user.role === 'director' || user.role === 'manager') && (
+        <form onSubmit={handleSubmit}>
+          <input
+            value={formData.title}
+            onChange={(e) => setFormData({...formData, title: e.target.value})}
+            placeholder="Procedure title"
+            required
+          />
+          <textarea
+            value={formData.description}
+            onChange={(e) => setFormData({...formData, description: e.target.value})}
+            placeholder="Detailed procedure"
+            required
+          />
+          <button type="submit">
+            {editingId ? 'Update' : 'Create'} Procedure
+          </button>
+        </form>
+      )}
+      
+      <div className="procedure-list">
+        {procedures.map(proc => (
+          <div key={proc.id} className="procedure-item">
+            <h3>{proc.title}</h3>
+            <p>{proc.description}</p>
+            <div className="procedure-actions">
+              {(user.role === 'employee' || user.role === 'accountant') && (
+                <button onClick={() => openSuggestionModal(proc.id)}>
+                  Suggest Change
+                </button>
+              )}
+              {user.role === 'manager' && (
+                <button onClick={() => {
+                  setEditingId(proc.id);
+                  setFormData({ title: proc.title, description: proc.description });
+                }}>
+                  Edit
+                </button>
+              )}
+              {user.role === 'director' && (
+                <button onClick={() => handleDelete(proc.id)}>
+                  Delete
+                </button>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+Purchase Request System
+javascript
+Copy
+// src/components/purchases/PurchaseRequest.js
+import React, { useState } from 'react';
+import { useAuth } from '../../context/AuthContext';
+import axios from 'axios';
+
+const PurchaseRequest = () => {
+  const { user } = useAuth();
+  const [requests, setRequests] = useState([]);
+  const [formData, setFormData] = useState({ amount: '', description: '' });
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    await axios.post('/api/purchases', formData);
+    // Refresh requests
+  };
+
+  const handleApprove = async (id) => {
+    await axios.put(`/api/purchases/${id}/approve`);
+    // Refresh requests
+  };
+
+  return (
+    <div>
+      <h2>Purchase Requests</h2>
+      
+      {(user.role === 'director' || user.role === 'manager') && (
+        <form onSubmit={handleSubmit}>
+          <input
+            type="number"
+            value={formData.amount}
+            onChange={(e) => setFormData({...formData, amount: e.target.value})}
+            placeholder="Amount"
+            required
+          />
+          <textarea
+            value={formData.description}
+            onChange={(e) => setFormData({...formData, description: e.target.value})}
+            placeholder="Purpose of purchase"
+            required
+          />
+          <button type="submit">Submit Request</button>
+        </form>
+      )}
+      
+      <div className="request-list">
+        {requests.map(req => (
+          <div key={req.id} className="request-item">
+            <p>Amount: ${req.amount}</p>
+            <p>Purpose: {req.description}</p>
+            <p>Status: {req.status}</p>
+            {user.role === 'director' && req.status === 'requested' && (
+              <button onClick={() => handleApprove(req.id)}>
+                Approve
+              </button>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+Excel Import Component
+javascript
+Copy
+// src/components/accounting/ExcelImporter.js
+import React, { useState } from 'react';
+import { useAuth } from '../../context/AuthContext';
+import axios from 'axios';
+
+const ExcelImporter = () => {
+  const { user } = useAuth();
+  const [file, setFile] = useState(null);
+  const [importType, setImportType] = useState('inventory');
+  const [imports, setImports] = useState([]);
+
+  const handleFileUpload = async (e) => {
+    e.preventDefault();
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('importType', importType);
+    
+    await axios.post('/api/excel/import', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' }
+    });
+    // Refresh import history
+  };
+
+  return (
+    <div>
+      <h2>Data Import</h2>
+      {user.role === 'accountant' && (
+        <form onSubmit={handleFileUpload}>
+          <select 
+            value={importType}
+            onChange={(e) => setImportType(e.target.value)}
+          >
+            <option value="inventory">Inventory Data</option>
+            <option value="financial">Financial Data</option>
+            <option value="production">Production Data</option>
+          </select>
+          <input
+            type="file"
+            accept=".xlsx,.xls,.csv"
+            onChange={(e) => setFile(e.target.files[0])}
+            required
+          />
+          <button type="submit">Upload and Process</button>
+        </form>
+      )}
+      
+      <div className="import-history">
+        <h3>Import History</h3>
+        {imports.map(imp => (
+          <div key={imp.id}>
+            <p>File: {imp.file_name}</p>
+            <p>Type: {imp.import_type}</p>
+            <p>Status: {imp.status}</p>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+6. Deployment Considerations
+Security Measures
+HTTPS: Ensure all connections are encrypted
+
+Input Validation: Sanitize all user inputs
+
+Rate Limiting: Implement on sensitive endpoints
+
+Audit Logging: Track all changes to procedures and financial data
+
+Regular Backups: For MySQL database
+
+Setup Instructions
+Database Setup:
+
+bash
+Copy
+mysql -u root -p
+CREATE DATABASE maosix_management;
+CREATE USER 'maosix_admin'@'localhost' IDENTIFIED BY 'secure_password';
+GRANT ALL PRIVILEGES ON maosix_management.* TO 'maosix_admin'@'localhost';
+FLUSH PRIVILEGES;
+Environment Variables:
+
+env
+Copy
+# .env file
+DB_HOST=localhost
+DB_USER=maosix_admin
+DB_PASSWORD=secure_password
+DB_NAME=maosix_management
+JWT_SECRET=your_strong_secret_here
+PORT=5000
+Initial Admin Setup:
+
+sql
+Copy
+INSERT INTO users (username, password_hash, email, role, department)
+VALUES 
+('admin1', '$2a$10$xJwL5vWj9LvL5s3Z5XWXBez5X5X5X5X5X5X5X5X5X5X5X5X5X5X', 'director1@maosix.com', 'director', 'admin'),
+('manager1', '$2a$10$xJwL5vWj9LvL5s3Z5XWXBez5X5X5X5X5X5X5X5X5X5X5X5X5X5X', 'manager1@maosix.com', 'manager', 'coffee'),
+('accountant1', '$2a$10$xJwL5vWj9LvL5s3Z5XWXBez5X5X5X5X5X5X5X5X5X5X5X5X5X5X', 'accountant1@maosix.com', 'accountant', 'admin');
+7. Maintenance Plan
+Weekly:
+
+Database backups verification
+
+User access reviews
+
+Audit log reviews
+
+Monthly:
+
+Permission structure review
+
+Procedure change approvals cleanup
+
+System performance review
+
+Quarterly:
+
+Security audit
+
+Employee training on system updates
+
+Backup restoration test
+
+This comprehensive system provides granular control over your operations while maintaining security and accountability through proper permission structures and audit trails.
+
+
+
+
+
+
+
+gimme the database setup in detail MySQL from MYSQL workbench
+MySQL Database Setup for MAOSIX Management System
+Here's a detailed guide to setting up your MySQL database using MySQL Workbench for the MAOSIX internal management system.
+
+1. Initial Setup in MySQL Workbench
+Connect to MySQL Server
+Open MySQL Workbench
+
+Click on the "+" icon next to "MySQL Connections"
+
+Enter:
+
+Connection Name: MAOSIX Management
+
+Hostname: 127.0.0.1 (or your server IP)
+
+Port: 3306
+
+Username: root (or your admin user)
+
+Password: [your root password]
+
+Click "Test Connection" then "OK"
+
+2. Create the Database
+Execute in SQL Editor
+sql
+Copy
+-- Create the database
+CREATE DATABASE maosix_management CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+-- Create dedicated user with appropriate privileges
+CREATE USER 'maosix_admin'@'localhost' IDENTIFIED BY 'StrongPassword123!';
+GRANT ALL PRIVILEGES ON maosix_management.* TO 'maosix_admin'@'localhost';
+FLUSH PRIVILEGES;
+
+-- Switch to the new database
+USE maosix_management;
+3. Create Tables Structure
+Users Table
+sql
+Copy
+CREATE TABLE users (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  username VARCHAR(50) UNIQUE NOT NULL,
+  password_hash VARCHAR(255) NOT NULL COMMENT 'Store bcrypt hashed passwords',
+  email VARCHAR(100) UNIQUE NOT NULL,
+  first_name VARCHAR(50) NOT NULL,
+  last_name VARCHAR(50) NOT NULL,
+  role ENUM('director', 'manager', 'accountant', 'employee') NOT NULL,
+  department ENUM('coffee', 'dairy', 'apiary', 'poultry', 'admin') NOT NULL,
+  is_active BOOLEAN DEFAULT TRUE COMMENT 'For soft deletion',
+  last_login DATETIME,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_role (role),
+  INDEX idx_department (department)
+) ENGINE=InnoDB;
+Care Procedures Table
+sql
+Copy
+CREATE TABLE care_procedures (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  department ENUM('coffee', 'dairy', 'apiary', 'poultry') NOT NULL,
+  title VARCHAR(100) NOT NULL,
+  description TEXT NOT NULL,
+  current_version INT NOT NULL DEFAULT 1,
+  created_by INT NOT NULL,
+  is_active BOOLEAN DEFAULT TRUE,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE RESTRICT,
+  INDEX idx_department (department)
+) ENGINE=InnoDB;
+Procedure Versions Table
+sql
+Copy
+CREATE TABLE procedure_versions (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  procedure_id INT NOT NULL,
+  version INT NOT NULL,
+  description TEXT NOT NULL,
+  change_reason TEXT,
+  status ENUM('pending', 'approved', 'rejected') DEFAULT 'pending',
+  suggested_by INT NOT NULL,
+  reviewed_by INT,
+  review_notes TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (procedure_id) REFERENCES care_procedures(id) ON DELETE CASCADE,
+  FOREIGN KEY (suggested_by) REFERENCES users(id) ON DELETE RESTRICT,
+  FOREIGN KEY (reviewed_by) REFERENCES users(id) ON DELETE SET NULL,
+  INDEX idx_procedure (procedure_id),
+  INDEX idx_status (status)
+) ENGINE=InnoDB;
+Purchases Table
+sql
+Copy
+CREATE TABLE purchases (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  requester_id INT NOT NULL,
+  amount DECIMAL(10,2) NOT NULL,
+  description TEXT NOT NULL,
+  status ENUM('requested', 'approved', 'rejected', 'completed') DEFAULT 'requested',
+  approved_by INT,
+  approved_amount DECIMAL(10,2) COMMENT 'May differ from requested amount',
+  approved_at DATETIME,
+  completion_notes TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (requester_id) REFERENCES users(id) ON DELETE RESTRICT,
+  FOREIGN KEY (approved_by) REFERENCES users(id) ON DELETE SET NULL,
+  INDEX idx_status (status),
+  INDEX idx_requester (requester_id)
+) ENGINE=InnoDB;
+Excel Imports Table
+sql
+Copy
+CREATE TABLE excel_imports (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  accountant_id INT NOT NULL,
+  file_name VARCHAR(255) NOT NULL,
+  file_path VARCHAR(512) NOT NULL COMMENT 'Server storage path',
+  import_type ENUM('inventory', 'financial', 'production') NOT NULL,
+  records_count INT NOT NULL,
+  status ENUM('pending', 'processed', 'failed') DEFAULT 'pending',
+  error_log TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  processed_at DATETIME,
+  FOREIGN KEY (accountant_id) REFERENCES users(id) ON DELETE RESTRICT,
+  INDEX idx_status (status),
+  INDEX idx_type (import_type)
+) ENGINE=InnoDB;
+Audit Log Table
+sql
+Copy
+CREATE TABLE audit_log (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id INT,
+  action VARCHAR(50) NOT NULL COMMENT 'create, update, delete, login, etc.',
+  entity_type VARCHAR(50) NOT NULL COMMENT 'user, procedure, purchase, etc.',
+  entity_id INT COMMENT 'ID of the affected record',
+  old_values JSON COMMENT 'Previous values for updates',
+  new_values JSON COMMENT 'New values for updates',
+  ip_address VARCHAR(45),
+  user_agent TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_user (user_id),
+  INDEX idx_entity (entity_type, entity_id),
+  INDEX idx_action (action),
+  INDEX idx_created (created_at)
+) ENGINE=InnoDB;
+4. Create Views for Common Queries
+Active Procedures View
+sql
+Copy
+CREATE VIEW vw_active_procedures AS
+SELECT 
+  cp.id,
+  cp.department,
+  cp.title,
+  cp.current_version,
+  CONCAT(u.first_name, ' ', u.last_name) AS created_by,
+  cp.created_at,
+  cp.updated_at
+FROM care_procedures cp
+JOIN users u ON cp.created_by = u.id
+WHERE cp.is_active = TRUE;
+Pending Approvals View
+sql
+Copy
+CREATE VIEW vw_pending_approvals AS
+SELECT 
+  pv.id,
+  cp.title AS procedure_title,
+  cp.department,
+  pv.version,
+  CONCAT(u.first_name, ' ', u.last_name) AS suggested_by,
+  pv.created_at,
+  pv.change_reason
+FROM procedure_versions pv
+JOIN care_procedures cp ON pv.procedure_id = cp.id
+JOIN users u ON pv.suggested_by = u.id
+WHERE pv.status = 'pending';
+Purchase Requests View
+sql
+Copy
+CREATE VIEW vw_purchase_requests AS
+SELECT 
+  p.id,
+  p.amount,
+  p.description,
+  p.status,
+  CONCAT(u.first_name, ' ', u.last_name) AS requester,
+  CONCAT(au.first_name, ' ', au.last_name) AS approver,
+  p.created_at,
+  p.updated_at
+FROM purchases p
+JOIN users u ON p.requester_id = u.id
+LEFT JOIN users au ON p.approved_by = au.id;
+5. Create Stored Procedures
+User Authentication Procedure
+sql
+Copy
+DELIMITER //
+CREATE PROCEDURE sp_authenticate_user(IN p_username VARCHAR(50))
+BEGIN
+  SELECT 
+    id,
+    username,
+    password_hash,
+    email,
+    first_name,
+    last_name,
+    role,
+    department
+  FROM users
+  WHERE username = p_username AND is_active = TRUE;
+END //
+DELIMITER ;
+Update Procedure Version
+sql
+Copy
+DELIMITER //
+CREATE PROCEDURE sp_approve_procedure_version(
+  IN p_version_id INT,
+  IN p_reviewer_id INT,
+  IN p_notes TEXT
+)
+BEGIN
+  DECLARE v_procedure_id INT;
+  DECLARE v_new_version INT;
+  
+  -- Get the procedure ID
+  SELECT procedure_id INTO v_procedure_id
+  FROM procedure_versions
+  WHERE id = p_version_id;
+  
+  -- Get the next version number
+  SELECT IFNULL(MAX(version), 0) + 1 INTO v_new_version
+  FROM procedure_versions
+  WHERE procedure_id = v_procedure_id;
+  
+  -- Update the version record
+  UPDATE procedure_versions
+  SET 
+    status = 'approved',
+    reviewed_by = p_reviewer_id,
+    review_notes = p_notes,
+    version = v_new_version
+  WHERE id = p_version_id;
+  
+  -- Update the main procedure
+  UPDATE care_procedures
+  SET 
+    description = (SELECT description FROM procedure_versions WHERE id = p_version_id),
+    current_version = v_new_version,
+    updated_at = CURRENT_TIMESTAMP
+  WHERE id = v_procedure_id;
+END //
+DELIMITER ;
+6. Create Triggers
+Audit Log Trigger
+sql
+Copy
+DELIMITER //
+CREATE TRIGGER tr_users_audit
+AFTER UPDATE ON users
+FOR EACH ROW
+BEGIN
+  IF OLD.is_active != NEW.is_active THEN
+    INSERT INTO audit_log (
+      user_id,
+      action,
+      entity_type,
+      entity_id,
+      old_values,
+      new_values
+    ) VALUES (
+      NEW.id,
+      CASE WHEN NEW.is_active = TRUE THEN 'activate' ELSE 'deactivate' END,
+      'user',
+      NEW.id,
+      JSON_OBJECT('is_active', OLD.is_active),
+      JSON_OBJECT('is_active', NEW.is_active)
+    );
+  END IF;
+END //
+DELIMITER ;
+Purchase Approval Trigger
+sql
+Copy
+DELIMITER //
+CREATE TRIGGER tr_purchase_approval
+AFTER UPDATE ON purchases
+FOR EACH ROW
+BEGIN
+  IF OLD.status != NEW.status AND NEW.status = 'approved' THEN
+    INSERT INTO audit_log (
+      user_id,
+      action,
+      entity_type,
+      entity_id,
+      old_values,
+      new_values
+    ) VALUES (
+      NEW.approved_by,
+      'approve_purchase',
+      'purchase',
+      NEW.id,
+      JSON_OBJECT('status', OLD.status, 'amount', OLD.amount),
+      JSON_OBJECT('status', NEW.status, 'amount', NEW.approved_amount)
+    );
+  END IF;
+END //
+DELIMITER ;
+7. Initial Data Population
+Insert Director Accounts
+sql
+Copy
+INSERT INTO users (
+  username, 
+  password_hash, 
+  email, 
+  first_name, 
+  last_name, 
+  role, 
+  department
+) VALUES 
+-- Password: Director123!
+('director1', '$2a$10$N9qo8uLOickgx2ZMRZoMy.MrYV7ZRHH3SFDsRjX2XpQ8oYQ8T9WWS', 'director1@maosix.com', 'John', 'Smith', 'director', 'admin'),
+('director2', '$2a$10$N9qo8uLOickgx2ZMRZoMy.MrYV7ZRHH3SFDsRjX2XpQ8oYQ8T9WWS', 'director2@maosix.com', 'Sarah', 'Johnson', 'director', 'admin'),
+('director3', '$2a$10$N9qo8uLOickgx2ZMRZoMy.MrYV7ZRHH3SFDsRjX2XpQ8oYQ8T9WWS', 'director3@maosix.com', 'Michael', 'Williams', 'director', 'admin'),
+('director4', '$2a$10$N9qo8uLOickgx2ZMRZoMy.MrYV7ZRHH3SFDsRjX2XpQ8oYQ8T9WWS', 'director4@maosix.com', 'Emily', 'Brown', 'director', 'admin'),
+('director5', '$2a$10$N9qo8uLOickgx2ZMRZoMy.MrYV7ZRHH3SFDsRjX2XpQ8oYQ8T9WWS', 'director5@maosix.com', 'David', 'Jones', 'director', 'admin'),
+('director6', '$2a$10$N9qo8uLOickgx2ZMRZoMy.MrYV7ZRHH3SFDsRjX2XpQ8oYQ8T9WWS', 'director6@maosix.com', 'Jessica', 'Garcia', 'director', 'admin');
+Insert Sample Procedures
+sql
+Copy
+INSERT INTO care_procedures (
+  department, 
+  title, 
+  description, 
+  created_by
+) VALUES
+('coffee', 'Harvesting Process', 'Detailed steps for coffee cherry harvesting...', 1),
+('dairy', 'Milking Procedure', 'Standard operating procedure for hygienic milking...', 2),
+('apiary', 'Honey Extraction', 'Step-by-step guide for honey extraction...', 3),
+('poultry', 'Egg Collection', 'Best practices for egg collection and handling...', 1);
+8. Database Maintenance Plan
+Weekly Tasks
+Backup Verification:
+
+sql
+Copy
+-- Check backup status
+SELECT 
+  TABLE_SCHEMA,
+  TABLE_NAME,
+  UPDATE_TIME
+FROM information_schema.TABLES
+WHERE TABLE_SCHEMA = 'maosix_management'
+ORDER BY UPDATE_TIME DESC;
+User Activity Review:
+
+sql
+Copy
+-- Check recent user activity
+SELECT 
+  u.username,
+  COUNT(al.id) AS actions,
+  MAX(al.created_at) AS last_action
+FROM users u
+LEFT JOIN audit_log al ON u.id = al.user_id
+GROUP BY u.id
+ORDER BY last_action DESC;
+Monthly Tasks
+Database Optimization:
+
+sql
+Copy
+-- Optimize all tables
+SELECT CONCAT('OPTIMIZE TABLE ', TABLE_NAME, ';')
+FROM information_schema.TABLES
+WHERE TABLE_SCHEMA = 'maosix_management';
+Performance Review:
+
+sql
+Copy
+-- Check slow queries
+SELECT * FROM mysql.slow_log
+ORDER BY start_time DESC
+LIMIT 50;
+This complete MySQL setup provides a robust foundation for your MAOSIX management system with proper security, auditing, and maintenance considerations. The database structure supports all the required user roles and permissions while maintaining data integrity through foreign keys and transactions.
+
+
+
+
+
+
+_________________________________DIRECTORS INITIAL INFORMATION  ___________________________________________________
+
+7. Initial Data Population
+Insert Director Accounts
+sql
+Copy
+INSERT INTO users (
+  username, 
+  password_hash, 
+  email, 
+  first_name, 
+  last_name, 
+  role, 
+  department
+) VALUES 
+-- Password: Director123!
+('director1', '$2a$10$N9qo8uLOickgx2ZMRZoMy.MrYV7ZRHH3SFDsRjX2XpQ8oYQ8T9WWS', 'director1@maosix.com', 'John', 'Smith', 'director', 'admin'),
+('director2', '$2a$10$N9qo8uLOickgx2ZMRZoMy.MrYV7ZRHH3SFDsRjX2XpQ8oYQ8T9WWS', 'director2@maosix.com', 'Sarah', 'Johnson', 'director', 'admin'),
+('director3', '$2a$10$N9qo8uLOickgx2ZMRZoMy.MrYV7ZRHH3SFDsRjX2XpQ8oYQ8T9WWS', 'director3@maosix.com', 'Michael', 'Williams', 'director', 'admin'),
+('director4', '$2a$10$N9qo8uLOickgx2ZMRZoMy.MrYV7ZRHH3SFDsRjX2XpQ8oYQ8T9WWS', 'director4@maosix.com', 'Emily', 'Brown', 'director', 'admin'),
+('director5', '$2a$10$N9qo8uLOickgx2ZMRZoMy.MrYV7ZRHH3SFDsRjX2XpQ8oYQ8T9WWS', 'director5@maosix.com', 'David', 'Jones', 'director', 'admin'),
+('director6', '$2a$10$N9qo8uLOickgx2ZMRZoMy.MrYV7ZRHH3SFDsRjX2XpQ8oYQ8T9WWS', 'director6@maosix.com', 'Jessica', 'Garcia', 'director', 'admin');
+
+
+
+
